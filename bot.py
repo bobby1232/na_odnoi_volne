@@ -1,6 +1,9 @@
 import asyncio, os, secrets
 from collections import defaultdict
 from pathlib import Path
+from html import escape
+from io import BytesIO
+from aiogram.types import BufferedInputFile
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
@@ -32,6 +35,65 @@ async def ask(uid,pid):
         await report(pid); return
     cat,title,opts=QUESTIONS[q]
     await bot.send_message(uid,f"Вопрос {q+1}/{len(QUESTIONS)} · {cat}\n\n{title}",reply_markup=keyboard(pid,q,opts))
+async def completed_pair(pid):
+    async with aiosqlite.connect(DB) as db:
+        async with db.execute("SELECT first_id,second_id FROM pairs WHERE id=?",(pid,)) as cur:
+            p=await cur.fetchone()
+    if not p or not p[1]: return None
+    a,b=await asyncio.gather(progress(pid,p[0]),progress(pid,p[1]))
+    if len(a)!=len(QUESTIONS) or len(b)!=len(QUESTIONS): return None
+    return p,a,b
+
+def report_keyboard(pid):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Полный отчёт",callback_data=f"full:{pid}")],
+        [InlineKeyboardButton(text="❌ Только расхождения",callback_data=f"diff:{pid}")]
+    ])
+
+def full_report_text(a,b,only_diff=False):
+    lines=["📋 ПОЛНЫЙ ОТЧЁТ ПАРЫ","Партнёр 1 / Партнёр 2",""]
+    current=None
+    for i,(cat,title,opts) in enumerate(QUESTIONS):
+        if only_diff and a[i]==b[i]: continue
+        if cat!=current:
+            current=cat; lines.append(f"\n📌 {cat}")
+        mark="✅" if a[i]==b[i] else "❌"
+        lines.append(f"{mark} {i+1}. {title}")
+        lines.append("  1: "+opts[a[i]])
+        lines.append("  2: "+opts[b[i]])
+        lines.append("  Все варианты: "+ " | ".join(opts))
+        lines.append("")
+    if only_diff and all(a[i]==b[i] for i in a): lines.append("Все ответы совпали.")
+    return "\n".join(lines)
+
+async def send_full_report(uid,pid,only_diff=False):
+    result=await completed_pair(pid)
+    if not result:
+        await bot.send_message(uid,"Отчёт станет доступен после завершения опроса обоими партнёрами.")
+        return
+    _,a,b=result
+    content=full_report_text(a,b,only_diff)
+    title="Только расхождения" if only_diff else "Полный отчёт"
+    # Send a UTF-8 attachment to avoid Telegram's 4096-character message limit.
+    file=BufferedInputFile(content.encode("utf-8"),filename="rasxozhdeniya.txt" if only_diff else "polny_otchet.txt")
+    await bot.send_document(uid,file,caption=f"📋 {title}: ответы обоих партнёров, все варианты и отметки ✅/❌.",reply_markup=report_keyboard(pid))
+
+@dp.callback_query(F.data.startswith(("full:","diff:")))
+async def detailed_callback(c):
+    mode,pid=c.data.split(":",1)
+    p=await pair(c.from_user.id)
+    if not p or p[0]!=pid:
+        await c.answer("Нет доступа к отчёту",show_alert=True); return
+    await c.answer("Формирую отчёт")
+    await send_full_report(c.from_user.id,pid,mode=="diff")
+
+@dp.message(Command("fullreport"))
+async def fullreport_command(m):
+    p=await pair(m.from_user.id)
+    if not p:
+        await m.answer("Начните с /start"); return
+    await send_full_report(m.from_user.id,p[0])
+
 async def report(pid):
     async with aiosqlite.connect(DB) as c:
         async with c.execute("SELECT first_id,second_id FROM pairs WHERE id=?",(pid,)) as cur: p=await cur.fetchone()
